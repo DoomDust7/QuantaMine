@@ -11,8 +11,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import yfinance as yf
 
-from app.models import AnalysisRequest
+from app.models import AnalysisRequest, PortfolioRequest
 from app.analyzer import run_analysis_stream
+from app.portfolio_allocator import run_portfolio_stream
 
 app = FastAPI(title="QuantaMine API", version="2.0.0", description="AI-Powered Stock Analyzer")
 
@@ -100,6 +101,41 @@ async def analyze_stream_live(req: AnalysisRequest):
         loop = asyncio.get_event_loop()
         def _run():
             for event in run_analysis_stream(req.tickers):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
+
+        await loop.run_in_executor(None, _run)
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        asyncio.create_task(producer())
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event, default=str)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/portfolio/stream/live")
+async def portfolio_stream_live(req: PortfolioRequest):
+    """
+    True streaming SSE endpoint for budget portfolio allocation.
+    Uses 5-year yfinance historical data to compute CAGR, Sharpe, and
+    max drawdown, then allocates the budget proportionally.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def producer():
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            for event in run_portfolio_stream(req.tickers, req.budget):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
             loop.call_soon_threadsafe(queue.put_nowait, None)  # sentinel
 

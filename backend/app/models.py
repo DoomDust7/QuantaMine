@@ -1,9 +1,26 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field
 from typing import List, Optional
 
 
 class AnalysisRequest(BaseModel):
     tickers: List[str]
+
+    @field_validator("tickers")
+    @classmethod
+    def validate_tickers(cls, v: List[str]) -> List[str]:
+        if not v:
+            raise ValueError("At least one ticker required")
+        if len(v) > 20:
+            raise ValueError("Maximum 20 tickers per request")
+        cleaned = [t.strip().upper() for t in v if t.strip()]
+        if not cleaned:
+            raise ValueError("No valid tickers provided")
+        return cleaned
+
+
+class PortfolioRequest(BaseModel):
+    tickers: List[str]
+    budget: float = Field(..., gt=0, le=10_000_000)
 
     @field_validator("tickers")
     @classmethod

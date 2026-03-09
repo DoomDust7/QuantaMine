@@ -59,3 +59,21 @@ export type SSEEvent =
   | { type: "result"; ticker: string; data: StockResult }
   | { type: "done"; progress: number; message: string }
   | { type: "error"; message: string };
+
+export type PortfolioResult = {
+  ticker: string;
+  allocation_pct: number;
+  allocation_usd: number;
+  cagr_5y: number | null;
+  sharpe_5y: number | null;
+  max_dd_5y: number | null;
+  annualized_vol: number | null;
+  composite_score: number;
+};
+
+export type PortfolioSSEEvent =
+  | { type: "progress"; stage: string; ticker?: string; progress: number; message: string }
+  | { type: "allocation"; ticker: string; data: PortfolioResult }
+  | { type: "summary"; text: string }
+  | { type: "done"; progress: number; message: string }
+  | { type: "error"; message: string };
