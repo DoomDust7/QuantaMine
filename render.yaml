@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: quantamine-backend
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: NEWSAPI_KEY
+        sync: false
+      - key: HUGGINGFACE_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: models/gemini-2.5-flash-lite
+      - key: WEIGHT_ALGO
+        value: "0.5"
+      - key: WEIGHT_SENT
+        value: "0.2"
+      - key: WEIGHT_LLM
+        value: "0.3"
+      - key: FRONTEND_URL
+        value: https://quantamine.vercel.app
