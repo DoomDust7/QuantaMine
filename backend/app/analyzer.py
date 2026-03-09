@@ -9,8 +9,11 @@ import re
 import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import lru_cache
 from typing import Any, Dict, Generator, List, Optional
+
+# Load .env before reading any env vars
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
 
 import numpy as np
 import pandas as pd
@@ -22,7 +25,7 @@ from urllib3.util.retry import Retry
 
 LOG = logging.getLogger(__name__)
 
-# ── Config from environment ──────────────────────────────────────────────────
+# ── Config (read after dotenv loads) ─────────────────────────────────────────
 HF_API_URL = os.getenv(
     "HUGGINGFACE_API_URL",
     "https://api-inference.huggingface.co/models/ProsusAI/finbert",
@@ -41,24 +44,18 @@ WEIGHTS = {
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+    LOG.info("Gemini configured with key ...%s", GEMINI_API_KEY[-6:])
+else:
+    LOG.warning("GEMINI_API_KEY not set — LLM scores will be neutral")
 
 # ── HTTP session with retries ─────────────────────────────────────────────────
 SESSION = requests.Session()
-_retry = Retry(total=3, backoff_factor=0.4, status_forcelist=[429, 500, 502, 503, 504])
+_retry = Retry(total=3, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
 SESSION.mount("https://", HTTPAdapter(max_retries=_retry))
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
-def safe_float(v) -> Optional[float]:
-    try:
-        if v is None or (isinstance(v, float) and np.isnan(v)):
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
 def safe_ratio(a, b) -> float:
     try:
         if a is None or b is None or pd.isna(a) or pd.isna(b) or b == 0:
@@ -112,14 +109,36 @@ def buy_rating(score: float) -> str:
     return "Avoid"
 
 
-# ── yfinance helpers ──────────────────────────────────────────────────────────
-@lru_cache(maxsize=256)
+# ── yfinance helpers (rate-limit aware) ───────────────────────────────────────
+_YF_DELAY = float(os.getenv("YF_REQUEST_DELAY", "1.0"))  # seconds between info calls
+
+
+_info_cache: Dict[str, Dict] = {}
+
+
 def _get_info(ticker: str) -> Dict[str, Any]:
-    try:
-        return yf.Ticker(ticker).info or {}
-    except Exception as e:
-        LOG.warning("yfinance info error %s: %s", ticker, e)
-        return {}
+    """Fetch ticker info with retry on 429. Only caches non-empty results."""
+    if ticker in _info_cache:
+        return _info_cache[ticker]
+    for attempt in range(4):
+        try:
+            info = yf.Ticker(ticker).info or {}
+            if info and len(info) > 5:  # real data has many keys; empty/soft-error has <5
+                _info_cache[ticker] = info
+                return info
+            wait = 2 ** attempt
+            LOG.warning("yfinance empty info for %s, waiting %ds (attempt %d)", ticker, wait, attempt + 1)
+            time.sleep(wait)
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "Too Many Requests" in msg or "JSONDecodeError" in msg:
+                wait = 3 * (2 ** attempt)  # 3s, 6s, 12s, 24s
+                LOG.warning("yfinance 429/error for %s, waiting %ds (attempt %d)", ticker, wait, attempt + 1)
+                time.sleep(wait)
+            else:
+                LOG.warning("yfinance info error %s: %s", ticker, e)
+                break
+    return {}
 
 
 def _get_history(ticker: str, period: str = "1y") -> pd.DataFrame:
@@ -291,9 +310,12 @@ def _build_prompt(row: pd.Series) -> str:
 
 
 def _gemini_call(prompt: str) -> Dict[str, Any]:
-    if not GEMINI_API_KEY:
+    # Re-read key at call time to handle lazy loading
+    api_key = os.getenv("GEMINI_API_KEY", GEMINI_API_KEY)
+    if not api_key:
         return {"confidence": 0.5, "reason": "Gemini API key not configured."}
     try:
+        genai.configure(api_key=api_key)
         model = genai.GenerativeModel(GEMINI_MODEL)
         resp = model.generate_content(
             prompt,
@@ -314,62 +336,49 @@ def _gemini_call(prompt: str) -> Dict[str, Any]:
             "reason": str(d.get("reason", ""))[:500],
         }
     except Exception as e:
-        LOG.debug("Gemini error: %s", e)
+        LOG.warning("Gemini error: %s", e)
         return {"confidence": 0.5, "reason": f"Analysis unavailable: {e}"}
 
 
 # ── Streaming pipeline ────────────────────────────────────────────────────────
 def run_analysis_stream(tickers: List[str]) -> Generator[Dict, None, None]:
-    """
-    Yields progress dicts with keys: type, ticker (optional), stage, progress, data (optional).
-    Consumers (FastAPI SSE endpoint) serialize these to JSON.
-    """
+    """Yields SSE-style event dicts as analysis progresses."""
     n = len(tickers)
+    yield {"type": "progress", "stage": "init", "progress": 2, "message": f"Starting analysis for {n} ticker(s)…"}
 
-    yield {"type": "progress", "stage": "init", "progress": 0, "message": f"Starting analysis for {n} ticker(s)…"}
-
-    # Step 1: fetch info & history per ticker
+    # Step 1: fetch data with delay to avoid Yahoo 429
     infos: Dict[str, Dict] = {}
     hists: Dict[str, pd.DataFrame] = {}
     for i, t in enumerate(tickers):
-        yield {"type": "progress", "stage": "fetch", "ticker": t, "progress": int(5 + (i / n) * 25), "message": f"Fetching data for {t}…"}
+        yield {"type": "progress", "stage": "fetch", "ticker": t,
+               "progress": int(5 + (i / n) * 25), "message": f"Fetching data for {t}…"}
+        if i > 0:
+            time.sleep(_YF_DELAY)
         infos[t] = _get_info(t)
         hists[t] = _get_history(t)
+        LOG.info("Fetched %s: %d info keys, %d history rows",
+                 t, len(infos[t]), len(hists[t]))
 
-    yield {"type": "progress", "stage": "compute", "progress": 30, "message": "Computing financial metrics…"}
+    yield {"type": "progress", "stage": "compute", "progress": 32, "message": "Computing financial metrics…"}
 
-    # Step 2: build metric DataFrames
-    df_val = _score_value(
-        pd.DataFrame([_value_row(t, infos[t]) for t in tickers]).apply(
-            lambda c: pd.to_numeric(c, errors="coerce") if c.name != "ticker" else c
-        )
-    )
-    df_qual = _score_quality(
-        pd.DataFrame([_quality_row(t, infos[t]) for t in tickers]).apply(
-            lambda c: pd.to_numeric(c, errors="coerce") if c.name != "ticker" else c
-        )
-    )
-    df_risk = _score_risk(
-        pd.DataFrame([_risk_row(t, hists[t]) for t in tickers]).apply(
-            lambda c: pd.to_numeric(c, errors="coerce") if c.name != "ticker" else c
-        )
-    )
-    df_mom = _score_momentum(
-        pd.DataFrame([_momentum_row(t, hists[t]) for t in tickers]).apply(
-            lambda c: pd.to_numeric(c, errors="coerce") if c.name != "ticker" else c
-        )
-    )
+    def to_numeric(df):
+        return df.apply(lambda c: pd.to_numeric(c, errors="coerce") if c.name != "ticker" else c)
 
-    yield {"type": "progress", "stage": "sentiment", "progress": 45, "message": "Analyzing news sentiment…"}
+    df_val = _score_value(to_numeric(pd.DataFrame([_value_row(t, infos[t]) for t in tickers])))
+    df_qual = _score_quality(to_numeric(pd.DataFrame([_quality_row(t, infos[t]) for t in tickers])))
+    df_risk = _score_risk(to_numeric(pd.DataFrame([_risk_row(t, hists[t]) for t in tickers])))
+    df_mom = _score_momentum(to_numeric(pd.DataFrame([_momentum_row(t, hists[t]) for t in tickers])))
 
-    # Step 3: sentiment per ticker
+    yield {"type": "progress", "stage": "sentiment", "progress": 48, "message": "Analyzing news sentiment…"}
+
     sent_rows = []
     for i, t in enumerate(tickers):
-        yield {"type": "progress", "stage": "sentiment", "ticker": t, "progress": int(45 + (i / n) * 15), "message": f"Sentiment for {t}…"}
+        yield {"type": "progress", "stage": "sentiment", "ticker": t,
+               "progress": int(48 + (i / n) * 14), "message": f"Sentiment for {t}…"}
         sent_rows.append({"ticker": t, "sentiment_score": _compute_sentiment(t)})
     df_sent = pd.DataFrame(sent_rows)
 
-    # Step 4: merge
+    # Merge
     df = (
         df_val.merge(df_qual, on="ticker", how="outer")
         .merge(df_risk, on="ticker", how="outer")
@@ -379,10 +388,12 @@ def run_analysis_stream(tickers: List[str]) -> Generator[Dict, None, None]:
     df["buy_score"] = df[["value_score", "quality_score", "risk_score", "momentum_score"]].mean(axis=1)
     df["buy_rating"] = df["buy_score"].apply(lambda x: buy_rating(clamp01(x)))
     df["sentiment_score"] = df["sentiment_score"].fillna(0.5)
+    df["llm_confidence"] = 0.5
+    df["llm_reason"] = "Pending"
 
-    yield {"type": "progress", "stage": "llm", "progress": 62, "message": "Running Gemini AI analysis…"}
+    yield {"type": "progress", "stage": "llm", "progress": 64, "message": "Running Gemini AI analysis…"}
 
-    # Step 5: Gemini concurrent
+    # Gemini concurrent
     with ThreadPoolExecutor(max_workers=min(8, n)) as pool:
         futures = {pool.submit(_gemini_call, _build_prompt(row)): i for i, row in df.iterrows()}
         completed = 0
@@ -397,14 +408,12 @@ def run_analysis_stream(tickers: List[str]) -> Generator[Dict, None, None]:
             completed += 1
             t = df.at[i, "ticker"]
             yield {
-                "type": "progress",
-                "stage": "llm",
-                "ticker": t,
-                "progress": int(62 + (completed / n) * 28),
+                "type": "progress", "stage": "llm", "ticker": t,
+                "progress": int(64 + (completed / n) * 28),
                 "message": f"Gemini reasoning for {t}…",
             }
 
-    # Step 6: final scores
+    # Final blend
     df["final_buy_score"] = (
         WEIGHTS["algo"] * df["buy_score"].fillna(0.5)
         + WEIGHTS["sentiment"] * df["sentiment_score"]
@@ -415,8 +424,7 @@ def run_analysis_stream(tickers: List[str]) -> Generator[Dict, None, None]:
 
     yield {"type": "progress", "stage": "done", "progress": 98, "message": "Finalizing results…"}
 
-    # Step 7: emit per-ticker results
-    SCORE_COLS = [
+    COLS = [
         "ticker", "final_buy_score", "final_rating",
         "buy_score", "buy_rating",
         "value_score", "quality_score", "risk_score", "momentum_score",
@@ -424,7 +432,7 @@ def run_analysis_stream(tickers: List[str]) -> Generator[Dict, None, None]:
         "pe", "pb", "peg", "div_yield", "ev_ebitda",
         "roe", "rev_growth", "ret_3m", "rsi", "vol", "sharpe_proxy",
     ]
-    available = [c for c in SCORE_COLS if c in df.columns]
+    available = [c for c in COLS if c in df.columns]
     for _, row in df[available].iterrows():
         record = {}
         for k, v in row.items():
@@ -440,7 +448,6 @@ def run_analysis_stream(tickers: List[str]) -> Generator[Dict, None, None]:
 
 
 def run_analysis(tickers: List[str]) -> pd.DataFrame:
-    """Synchronous version — collects all streaming events and returns final DataFrame."""
     results = []
     for event in run_analysis_stream(tickers):
         if event.get("type") == "result":

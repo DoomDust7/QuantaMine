@@ -2,6 +2,9 @@ import json
 import os
 import asyncio
 from typing import AsyncGenerator
+from dotenv import load_dotenv
+
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "../../.env"))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
